@@ -1,7 +1,7 @@
 import datetime as dt
 import unittest
 
-from sync_canvas_deadlines import parse_canvas_deadlines
+from sync_canvas_deadlines import parse_canvas_deadlines, parse_slack_deadlines
 
 
 SAMPLE_ICS = """BEGIN:VCALENDAR
@@ -43,6 +43,49 @@ class CanvasDeadlineParserTest(unittest.TestCase):
         self.assertEqual(deadlines[0].due_at.hour, 23)
         self.assertEqual(deadlines[0].course, "ECON 5")
         self.assertEqual(deadlines[1].due_at, dt.datetime(2026, 5, 18, 23, 59, tzinfo=deadlines[1].due_at.tzinfo))
+
+
+class SlackDeadlineParserTest(unittest.TestCase):
+    def test_parses_slack_due_date_message(self):
+        messages = {
+            "C123": [
+                {
+                    "ts": "1778544000.000000",
+                    "text": "Project proposal due Friday May 15 at 2pm",
+                    "permalink": "https://example.slack.com/archives/C123/p1",
+                }
+            ]
+        }
+        deadlines = parse_slack_deadlines(
+            messages,
+            "America/Los_Angeles",
+            ["due", "deadline"],
+            [],
+        )
+        self.assertEqual(len(deadlines), 1)
+        self.assertEqual(deadlines[0].source, "slack")
+        self.assertEqual(deadlines[0].course, "C123")
+        self.assertIn("Project proposal", deadlines[0].title)
+        self.assertEqual(deadlines[0].due_at.hour, 14)
+
+    def test_defaults_date_only_slack_items_to_end_of_day(self):
+        messages = {
+            "C123": [
+                {
+                    "ts": "1778544000.000000",
+                    "text": "Submit draft by May 16",
+                }
+            ]
+        }
+        deadlines = parse_slack_deadlines(
+            messages,
+            "America/Los_Angeles",
+            ["submit"],
+            [],
+        )
+        self.assertEqual(len(deadlines), 1)
+        self.assertEqual(deadlines[0].due_at.hour, 23)
+        self.assertEqual(deadlines[0].due_at.minute, 59)
 
 
 if __name__ == "__main__":

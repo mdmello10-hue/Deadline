@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sync Canvas due dates from an iCal feed into Google Calendar."""
+"""Sync Canvas and Slack due dates into Google Calendar."""
 
 from __future__ import annotations
 
@@ -11,24 +11,29 @@ import os
 import re
 import sys
 import urllib.request
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
 
 DEFAULT_ENV = ".env"
-DEFAULT_TITLE_PREFIX = "Canvas Due:"
 
 
 @dataclass(frozen=True)
-class CanvasDeadline:
+class Deadline:
     uid: str
     title: str
     due_at: dt.datetime
+    source: str
     url: str = ""
     course: str = ""
     description: str = ""
+    source_id: str = ""
+
+
+CanvasDeadline = Deadline
 
 
 def load_env_file(path: Path) -> None:
@@ -47,6 +52,11 @@ def load_env_file(path: Path) -> None:
 def csv_env(name: str, default: str) -> List[str]:
     value = os.environ.get(name, default)
     return [part.strip().lower() for part in value.split(",") if part.strip()]
+
+
+def csv_env_raw(name: str, default: str = "") -> List[str]:
+    value = os.environ.get(name, default)
+    return [part.strip() for part in value.split(",") if part.strip()]
 
 
 def unfold_ics_lines(text: str) -> List[str]:
@@ -191,7 +201,7 @@ def extract_course(
     return ""
 
 
-def should_include(deadline: CanvasDeadline, include_keywords: Sequence[str], exclude_keywords: Sequence[str]) -> bool:
+def should_include(deadline: Deadline, include_keywords: Sequence[str], exclude_keywords: Sequence[str]) -> bool:
     haystack = " ".join([deadline.title, deadline.url, deadline.course, deadline.description]).lower()
     if any(keyword in haystack for keyword in exclude_keywords):
         return False
@@ -229,9 +239,11 @@ def parse_canvas_deadlines(
             uid=normalize_uid(uid, title, due_at, url),
             title=title,
             due_at=due_at,
+            source="canvas",
             url=url,
             course=course,
             description=description,
+            source_id=course,
         )
         if should_include(deadline, include_keywords, exclude_keywords):
             deadlines.append(deadline)
@@ -242,6 +254,200 @@ def fetch_canvas_feed(url: str) -> str:
     request = urllib.request.Request(url, headers={"User-Agent": "canvas-deadline-sync/1.0"})
     with urllib.request.urlopen(request, timeout=30) as response:
         return response.read().decode("utf-8")
+
+
+def slack_api(token: str, method: str, params: Dict[str, str]) -> Dict[str, Any]:
+    url = f"https://slack.com/api/{method}"
+    if params:
+        url = f"{url}?{urllib.parse.urlencode(params)}"
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "deadline-sync/1.0",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    if not payload.get("ok"):
+        raise RuntimeError(f"Slack API {method} failed: {payload.get('error', 'unknown_error')}")
+    return payload
+
+
+def slack_ts_to_datetime(ts: str, timezone_name: str) -> dt.datetime:
+    seconds = float(ts)
+    return dt.datetime.fromtimestamp(seconds, tz=ZoneInfo(timezone_name))
+
+
+def clean_slack_text(text: str) -> str:
+    text = re.sub(r"<(https?://[^>|]+)\|([^>]+)>", r"\2 (\1)", text)
+    text = re.sub(r"<(https?://[^>]+)>", r"\1", text)
+    text = re.sub(r"<[@#!][^>]+>", "", text)
+    text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def slack_message_title(text: str, matched_date_text: str) -> str:
+    title = text
+    if matched_date_text:
+        title = title.replace(matched_date_text, " ")
+    title = re.sub(r"\b(due|deadline|by|before|on|at)\b\s*[:\-]?", " ", title, flags=re.IGNORECASE)
+    title = re.sub(r"\s+", " ", title).strip(" -:;")
+    if not title:
+        title = text
+    return title[:120].rstrip()
+
+
+def search_dates_in_text(text: str, base: dt.datetime, timezone_name: str) -> List[Tuple[str, dt.datetime]]:
+    try:
+        from dateparser.search import search_dates
+    except ImportError as exc:
+        raise SystemExit("Missing Slack date parser. Run: python3 -m pip install -r requirements.txt") from exc
+
+    results = search_dates(
+        text,
+        settings={
+            "PREFER_DATES_FROM": "future",
+            "RELATIVE_BASE": base,
+            "RETURN_AS_TIMEZONE_AWARE": True,
+            "TIMEZONE": timezone_name,
+        },
+    )
+    if not results:
+        return []
+    parsed: List[Tuple[str, dt.datetime]] = []
+    default_tz = ZoneInfo(timezone_name)
+    for matched_text, value in results:
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=default_tz)
+        parsed.append((matched_text, value.astimezone(default_tz)))
+    return parsed
+
+
+def likely_date_only(matched_text: str) -> bool:
+    return not re.search(r"\b\d{1,2}(:\d{2})?\s*(am|pm)\b|\b(noon|midnight)\b", matched_text, re.IGNORECASE)
+
+
+def should_include_slack_message(text: str, include_keywords: Sequence[str], exclude_keywords: Sequence[str]) -> bool:
+    lowered = text.lower()
+    if any(keyword in lowered for keyword in exclude_keywords):
+        return False
+    return any(keyword in lowered for keyword in include_keywords)
+
+
+def fetch_slack_messages(
+    token: str,
+    channel_id: str,
+    oldest: dt.datetime,
+    timezone_name: str,
+    limit: int = 200,
+) -> Iterable[Dict[str, Any]]:
+    cursor = ""
+    while True:
+        params = {
+            "channel": channel_id,
+            "oldest": str(oldest.timestamp()),
+            "limit": str(limit),
+        }
+        if cursor:
+            params["cursor"] = cursor
+        payload = slack_api(token, "conversations.history", params)
+        for message in payload.get("messages", []):
+            if message.get("subtype") in {"channel_join", "channel_leave", "channel_purpose", "channel_topic"}:
+                continue
+            yield message
+        cursor = payload.get("response_metadata", {}).get("next_cursor", "")
+        if not cursor:
+            break
+
+
+def slack_permalink(token: str, channel_id: str, message_ts: str) -> str:
+    try:
+        payload = slack_api(token, "chat.getPermalink", {"channel": channel_id, "message_ts": message_ts})
+        return payload.get("permalink", "")
+    except Exception:
+        return ""
+
+
+def parse_slack_deadlines(
+    messages_by_channel: Dict[str, Sequence[Dict[str, Any]]],
+    timezone_name: str,
+    include_keywords: Sequence[str],
+    exclude_keywords: Sequence[str],
+    default_date_hour: int = 23,
+    default_date_minute: int = 59,
+) -> List[Deadline]:
+    deadlines: List[Deadline] = []
+    default_tz = ZoneInfo(timezone_name)
+    for channel_id, messages in messages_by_channel.items():
+        for message in messages:
+            message_ts = str(message.get("ts", ""))
+            text = clean_slack_text(str(message.get("text", "")))
+            if not message_ts or not text:
+                continue
+            if not should_include_slack_message(text, include_keywords, exclude_keywords):
+                continue
+            base = slack_ts_to_datetime(message_ts, timezone_name)
+            parsed_dates = search_dates_in_text(text, base, timezone_name)
+            for index, (matched_text, due_at) in enumerate(parsed_dates):
+                if due_at < base - dt.timedelta(hours=1):
+                    continue
+                if likely_date_only(matched_text):
+                    due_at = due_at.astimezone(default_tz).replace(
+                        hour=default_date_hour,
+                        minute=default_date_minute,
+                        second=0,
+                        microsecond=0,
+                    )
+                title = slack_message_title(text, matched_text)
+                stable = f"{channel_id}:{message_ts}:{index}"
+                uid = "slack-" + hashlib.sha256(stable.encode("utf-8")).hexdigest()[:24]
+                deadlines.append(
+                    Deadline(
+                        uid=uid,
+                        title=title,
+                        due_at=due_at,
+                        source="slack",
+                        url=str(message.get("permalink", "")),
+                        course=channel_id,
+                        description=text,
+                        source_id=channel_id,
+                    )
+                )
+    return sorted(deadlines, key=lambda item: item.due_at)
+
+
+def fetch_slack_deadlines_from_env(timezone_name: str) -> List[Deadline]:
+    token = os.environ.get("SLACK_BOT_TOKEN") or os.environ.get("SLACK_USER_TOKEN") or ""
+    channel_ids = csv_env_raw("SLACK_CHANNEL_IDS")
+    if not token or not channel_ids:
+        return []
+
+    lookback_days = int(os.environ.get("SLACK_LOOKBACK_DAYS", "14"))
+    now = dt.datetime.now(ZoneInfo(timezone_name))
+    oldest = now - dt.timedelta(days=lookback_days)
+    include_keywords = csv_env(
+        "SLACK_INCLUDE_KEYWORDS",
+        "due,deadline,by,eod,submit,submission,assignment,event,meeting,presentation,exam,quiz,paper",
+    )
+    exclude_keywords = csv_env("SLACK_EXCLUDE_KEYWORDS", "")
+    default_hour = int(os.environ.get("SLACK_DEFAULT_DUE_HOUR", "23"))
+    default_minute = int(os.environ.get("SLACK_DEFAULT_DUE_MINUTE", "59"))
+
+    messages_by_channel: Dict[str, List[Dict[str, Any]]] = {}
+    for channel_id in channel_ids:
+        messages = list(fetch_slack_messages(token, channel_id, oldest, timezone_name))
+        for message in messages:
+            message["permalink"] = slack_permalink(token, channel_id, str(message.get("ts", "")))
+        messages_by_channel[channel_id] = messages
+    return parse_slack_deadlines(
+        messages_by_channel,
+        timezone_name,
+        include_keywords,
+        exclude_keywords,
+        default_hour,
+        default_minute,
+    )
 
 
 def require_google_service(token_file: Path, client_secrets_file: Path):
@@ -276,24 +482,29 @@ def require_google_service(token_file: Path, client_secrets_file: Path):
 
 
 def event_body(
-    deadline: CanvasDeadline,
+    deadline: Deadline,
     duration_minutes: int,
     reminder_minutes: Sequence[int],
     timezone_name: str,
-    title_prefix: str = DEFAULT_TITLE_PREFIX,
 ) -> Dict[str, object]:
     end_at = deadline.due_at + dt.timedelta(minutes=duration_minutes)
+    source_label = deadline.source.title()
+    source_name = "Canvas assignment" if deadline.source == "canvas" else f"{source_label} item"
     description_parts = [
-        f"Canvas assignment synced from {deadline.url or 'Canvas calendar feed'}.",
-        f"Canvas UID: {deadline.uid}",
+        f"{source_name} synced from {deadline.url or deadline.source}.",
+        f"Deadline UID: {deadline.uid}",
+        f"Source: {deadline.source}",
     ]
     if deadline.course:
-        description_parts.append(f"Course: {deadline.course}")
+        label = "Course" if deadline.source == "canvas" else "Slack channel"
+        description_parts.append(f"{label}: {deadline.course}")
+    if deadline.source == "canvas":
+        description_parts.append(f"Canvas UID: {deadline.uid}")
     if deadline.description:
         description_parts.append("")
         description_parts.append(deadline.description)
     return {
-        "summary": f"{title_prefix} {deadline.title}",
+        "summary": f"{source_label} Due: {deadline.title}",
         "description": "\n".join(description_parts),
         "start": {"dateTime": deadline.due_at.isoformat(), "timeZone": timezone_name},
         "end": {"dateTime": end_at.isoformat(), "timeZone": timezone_name},
@@ -305,31 +516,36 @@ def event_body(
         "extendedProperties": {
             "private": {
                 "canvas_uid": deadline.uid,
-                "canvas_deadline_sync": "true",
+                "deadline_uid": deadline.uid,
+                "deadline_sync": "true",
+                "deadline_source": deadline.source,
             }
         },
     }
 
 
-def find_existing_event(service, calendar_id: str, deadline: CanvasDeadline) -> Optional[Dict[str, object]]:
-    response = (
-        service.events()
-        .list(
-            calendarId=calendar_id,
-            privateExtendedProperty=f"canvas_uid={deadline.uid}",
-            singleEvents=True,
-            maxResults=10,
+def find_existing_event(service, calendar_id: str, deadline: Deadline) -> Optional[Dict[str, object]]:
+    for property_name in ("deadline_uid", "canvas_uid"):
+        response = (
+            service.events()
+            .list(
+                calendarId=calendar_id,
+                privateExtendedProperty=f"{property_name}={deadline.uid}",
+                singleEvents=True,
+                maxResults=10,
+            )
+            .execute()
         )
-        .execute()
-    )
-    items = response.get("items", [])
-    return items[0] if items else None
+        items = response.get("items", [])
+        if items:
+            return items[0]
+    return None
 
 
 def upsert_deadline(
     service,
     calendar_id: str,
-    deadline: CanvasDeadline,
+    deadline: Deadline,
     duration_minutes: int,
     reminder_minutes: Sequence[int],
     timezone_name: str,
@@ -343,7 +559,7 @@ def upsert_deadline(
     return "created"
 
 
-def filter_window(deadlines: Sequence[CanvasDeadline], now: dt.datetime, lookahead_days: int) -> List[CanvasDeadline]:
+def filter_window(deadlines: Sequence[Deadline], now: dt.datetime, lookahead_days: int) -> List[Deadline]:
     end = now + dt.timedelta(days=lookahead_days)
     return [deadline for deadline in deadlines if now <= deadline.due_at <= end]
 
@@ -358,22 +574,24 @@ def reminder_minutes_from_env() -> List[int]:
     return minutes or [1440, 60]
 
 
-def print_deadlines(deadlines: Sequence[CanvasDeadline]) -> None:
+def print_deadlines(deadlines: Sequence[Deadline]) -> None:
     if not deadlines:
-        print("No Canvas deadlines found in the configured window.")
+        print("No deadlines found in the configured window.")
         return
     for deadline in deadlines:
-        course = f" [{deadline.course}]" if deadline.course else ""
-        print(f"- {deadline.due_at:%a %b %-d, %Y %-I:%M %p}: {deadline.title}{course}")
+        source = deadline.source.title()
+        context = f" [{deadline.course}]" if deadline.course else ""
+        print(f"- {deadline.due_at:%a %b %-d, %Y %-I:%M %p}: {source}: {deadline.title}{context}")
 
 
-def deadlines_to_json(deadlines: Sequence[CanvasDeadline]) -> str:
+def deadlines_to_json(deadlines: Sequence[Deadline]) -> str:
     payload = [
         {
             "uid": deadline.uid,
             "title": deadline.title,
             "course": deadline.course,
             "due_at": deadline.due_at.isoformat(),
+            "source": deadline.source,
             "url": deadline.url,
         }
         for deadline in deadlines
@@ -382,7 +600,7 @@ def deadlines_to_json(deadlines: Sequence[CanvasDeadline]) -> str:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Sync Canvas iCal due dates into Google Calendar.")
+    parser = argparse.ArgumentParser(description="Sync Canvas and Slack due dates into Google Calendar.")
     parser.add_argument("--env", default=DEFAULT_ENV, help="Path to env file. Default: .env")
     parser.add_argument("--apply", action="store_true", help="Actually create/update Google Calendar events.")
     parser.add_argument("--ics-file", help="Read an exported Canvas .ics file instead of fetching the feed.")
@@ -397,15 +615,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     exclude_keywords = csv_env("EXCLUDE_KEYWORDS", "office hours,ta oh,zoom online meeting")
 
+    deadlines: List[Deadline] = []
     if args.ics_file:
         ics_text = Path(args.ics_file).read_text(encoding="utf-8")
+        deadlines.extend(parse_canvas_deadlines(ics_text, timezone_name, include_keywords, exclude_keywords))
     else:
         feed_url = os.environ.get("CANVAS_CALENDAR_FEED_URL", "").strip()
-        if not feed_url:
+        slack_configured = bool(
+            (os.environ.get("SLACK_BOT_TOKEN") or os.environ.get("SLACK_USER_TOKEN"))
+            and csv_env_raw("SLACK_CHANNEL_IDS")
+        )
+        if not feed_url and not slack_configured:
             raise SystemExit("Set CANVAS_CALENDAR_FEED_URL in .env before running this.")
-        ics_text = fetch_canvas_feed(feed_url)
+        if feed_url:
+            ics_text = fetch_canvas_feed(feed_url)
+            deadlines.extend(parse_canvas_deadlines(ics_text, timezone_name, include_keywords, exclude_keywords))
 
-    deadlines = parse_canvas_deadlines(ics_text, timezone_name, include_keywords, exclude_keywords)
+    deadlines.extend(fetch_slack_deadlines_from_env(timezone_name))
+    deadlines = sorted(deadlines, key=lambda item: item.due_at)
     now = dt.datetime.now(ZoneInfo(timezone_name))
     lookahead_days = int(os.environ.get("LOOKAHEAD_DAYS", "120"))
     deadlines = filter_window(deadlines, now, lookahead_days)

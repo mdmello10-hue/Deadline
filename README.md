@@ -1,11 +1,12 @@
 # Deadline
 
-Sync Canvas assignment due dates into Google Calendar.
+Sync Canvas and Slack due dates into Google Calendar.
 
 ## What It Does
 
 - Reads your Canvas Calendar Feed URL.
-- Finds assignments, quizzes, discussions, exams, papers, and similar deadline items.
+- Optionally scans selected Slack channels for due dates and event times.
+- Finds assignments, quizzes, discussions, exams, papers, events, and similar deadline items.
 - Skips obvious calendar noise such as TA office hours.
 - Creates or updates Google Calendar events with:
   - 24-hour reminder
@@ -30,14 +31,27 @@ Sync Canvas assignment due dates into Google Calendar.
    CANVAS_CALENDAR_FEED_URL=...
    ```
 
-4. Install dependencies:
+4. Optional: add Slack.
+
+   Create a Slack app or token with read access to the channels you want to scan,
+   invite the app to those channels if needed, and fill in:
+
+   ```bash
+   SLACK_BOT_TOKEN=xoxb-...
+   SLACK_CHANNEL_IDS=C012ABCDEF,C987ZYXWVU
+   ```
+
+   Slack channel IDs are available from each channel's profile/details panel.
+   Keep the token in `.env`; do not commit it.
+
+5. Install dependencies:
 
    ```bash
    python3 -m venv .venv
    .venv/bin/python -m pip install -r requirements.txt
    ```
 
-5. Add Google OAuth credentials at:
+6. Add Google OAuth credentials at:
 
    ```text
    secrets/google_client_secret.json
@@ -94,4 +108,4 @@ event and updates existing matching events instead of creating duplicates.
 ## Security Notes
 
 Do not commit `.env`, `.venv/`, or `secrets/`. The included `.gitignore` keeps
-Canvas feed URLs, Google OAuth files, and local tokens out of the repository.
+Canvas feed URLs, Slack tokens, Google OAuth files, and local tokens out of the repository.
