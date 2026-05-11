@@ -1,0 +1,6 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+secrets/
+.canvas_deadline_sync_state.json
