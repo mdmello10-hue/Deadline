@@ -64,7 +64,7 @@ class SlackDeadlineParserTest(unittest.TestCase):
         )
         self.assertEqual(len(deadlines), 1)
         self.assertEqual(deadlines[0].source, "slack")
-        self.assertEqual(deadlines[0].course, "C123")
+        self.assertEqual(deadlines[0].course, "slack:C123")
         self.assertIn("Project proposal", deadlines[0].title)
         self.assertEqual(deadlines[0].due_at.hour, 14)
 
@@ -86,6 +86,25 @@ class SlackDeadlineParserTest(unittest.TestCase):
         self.assertEqual(len(deadlines), 1)
         self.assertEqual(deadlines[0].due_at.hour, 23)
         self.assertEqual(deadlines[0].due_at.minute, 59)
+
+    def test_names_slack_workspace_source(self):
+        messages = {
+            "C123": [
+                {
+                    "ts": "1778544000.000000",
+                    "text": "Client deck due May 16",
+                }
+            ]
+        }
+        deadlines = parse_slack_deadlines(
+            messages,
+            "America/Los_Angeles",
+            ["due"],
+            [],
+            source_name="TCG",
+        )
+        self.assertEqual(len(deadlines), 1)
+        self.assertEqual(deadlines[0].course, "TCG:C123")
 
 
 if __name__ == "__main__":

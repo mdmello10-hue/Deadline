@@ -44,6 +44,18 @@ Sync Canvas and Slack due dates into Google Calendar.
    Slack channel IDs are available from each channel's profile/details panel.
    Keep the token in `.env`; do not commit it.
 
+   For multiple Slack workspaces, use one source per workspace:
+
+   ```bash
+   SLACK_SOURCES=TCG,PBL,CORNERSTONE
+   SLACK_TCG_BOT_TOKEN=xoxb-...
+   SLACK_TCG_CHANNEL_IDS=C012ABCDEF,C987ZYXWVU
+   SLACK_PBL_BOT_TOKEN=xoxb-...
+   SLACK_PBL_CHANNEL_IDS=C111ABCDEF
+   SLACK_CORNERSTONE_BOT_TOKEN=xoxb-...
+   SLACK_CORNERSTONE_CHANNEL_IDS=C222ABCDEF
+   ```
+
 5. Install dependencies:
 
    ```bash
@@ -102,8 +114,9 @@ cd /path/to/Deadline
 .venv/bin/python sync_canvas_deadlines.py --apply --env .env
 ```
 
-The script is safe to run repeatedly. It stores the Canvas UID on each calendar
-event and updates existing matching events instead of creating duplicates.
+The script is safe to run repeatedly. It stores a stable deadline UID on each
+calendar event and updates existing matching events instead of creating
+duplicates.
 
 ## Security Notes
 

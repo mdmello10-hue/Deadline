@@ -36,6 +36,13 @@ class Deadline:
 CanvasDeadline = Deadline
 
 
+@dataclass(frozen=True)
+class SlackSource:
+    name: str
+    token: str
+    channel_ids: List[str]
+
+
 def load_env_file(path: Path) -> None:
     if not path.exists():
         return
@@ -376,6 +383,7 @@ def parse_slack_deadlines(
     exclude_keywords: Sequence[str],
     default_date_hour: int = 23,
     default_date_minute: int = 59,
+    source_name: str = "slack",
 ) -> List[Deadline]:
     deadlines: List[Deadline] = []
     default_tz = ZoneInfo(timezone_name)
@@ -400,7 +408,8 @@ def parse_slack_deadlines(
                         microsecond=0,
                     )
                 title = slack_message_title(text, matched_text)
-                stable = f"{channel_id}:{message_ts}:{index}"
+                source_id = f"{source_name}:{channel_id}"
+                stable = f"{source_id}:{message_ts}:{index}"
                 uid = "slack-" + hashlib.sha256(stable.encode("utf-8")).hexdigest()[:24]
                 deadlines.append(
                     Deadline(
@@ -409,18 +418,41 @@ def parse_slack_deadlines(
                         due_at=due_at,
                         source="slack",
                         url=str(message.get("permalink", "")),
-                        course=channel_id,
+                        course=source_id,
                         description=text,
-                        source_id=channel_id,
+                        source_id=source_id,
                     )
                 )
     return sorted(deadlines, key=lambda item: item.due_at)
 
 
-def fetch_slack_deadlines_from_env(timezone_name: str) -> List[Deadline]:
-    token = os.environ.get("SLACK_BOT_TOKEN") or os.environ.get("SLACK_USER_TOKEN") or ""
-    channel_ids = csv_env_raw("SLACK_CHANNEL_IDS")
-    if not token or not channel_ids:
+def normalize_slack_source_name(value: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", value).strip("_").upper()
+    return normalized or "DEFAULT"
+
+
+def configured_slack_sources() -> List[SlackSource]:
+    source_names = csv_env_raw("SLACK_SOURCES")
+    if not source_names:
+        token = os.environ.get("SLACK_BOT_TOKEN") or os.environ.get("SLACK_USER_TOKEN") or ""
+        channel_ids = csv_env_raw("SLACK_CHANNEL_IDS")
+        return [SlackSource("slack", token, channel_ids)] if token and channel_ids else []
+
+    sources: List[SlackSource] = []
+    for source_name in source_names:
+        prefix = f"SLACK_{normalize_slack_source_name(source_name)}"
+        token = os.environ.get(f"{prefix}_BOT_TOKEN") or os.environ.get(f"{prefix}_USER_TOKEN") or ""
+        channel_ids = csv_env_raw(f"{prefix}_CHANNEL_IDS")
+        if token and channel_ids:
+            sources.append(SlackSource(source_name.strip(), token, channel_ids))
+    return sources
+
+
+def fetch_slack_deadlines_from_env(
+    timezone_name: str, sources: Optional[Sequence[SlackSource]] = None
+) -> List[Deadline]:
+    sources = list(sources if sources is not None else configured_slack_sources())
+    if not sources:
         return []
 
     lookback_days = int(os.environ.get("SLACK_LOOKBACK_DAYS", "14"))
@@ -434,20 +466,26 @@ def fetch_slack_deadlines_from_env(timezone_name: str) -> List[Deadline]:
     default_hour = int(os.environ.get("SLACK_DEFAULT_DUE_HOUR", "23"))
     default_minute = int(os.environ.get("SLACK_DEFAULT_DUE_MINUTE", "59"))
 
-    messages_by_channel: Dict[str, List[Dict[str, Any]]] = {}
-    for channel_id in channel_ids:
-        messages = list(fetch_slack_messages(token, channel_id, oldest, timezone_name))
-        for message in messages:
-            message["permalink"] = slack_permalink(token, channel_id, str(message.get("ts", "")))
-        messages_by_channel[channel_id] = messages
-    return parse_slack_deadlines(
-        messages_by_channel,
-        timezone_name,
-        include_keywords,
-        exclude_keywords,
-        default_hour,
-        default_minute,
-    )
+    deadlines: List[Deadline] = []
+    for source in sources:
+        messages_by_channel: Dict[str, List[Dict[str, Any]]] = {}
+        for channel_id in source.channel_ids:
+            messages = list(fetch_slack_messages(source.token, channel_id, oldest, timezone_name))
+            for message in messages:
+                message["permalink"] = slack_permalink(source.token, channel_id, str(message.get("ts", "")))
+            messages_by_channel[channel_id] = messages
+        deadlines.extend(
+            parse_slack_deadlines(
+                messages_by_channel,
+                timezone_name,
+                include_keywords,
+                exclude_keywords,
+                default_hour,
+                default_minute,
+                source.name,
+            )
+        )
+    return sorted(deadlines, key=lambda item: item.due_at)
 
 
 def require_google_service(token_file: Path, client_secrets_file: Path):
@@ -614,6 +652,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "assignment,quiz,discussion,exam,paper,reflection,submission,lecture engagement,bluebook",
     )
     exclude_keywords = csv_env("EXCLUDE_KEYWORDS", "office hours,ta oh,zoom online meeting")
+    slack_sources = configured_slack_sources()
 
     deadlines: List[Deadline] = []
     if args.ics_file:
@@ -621,17 +660,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         deadlines.extend(parse_canvas_deadlines(ics_text, timezone_name, include_keywords, exclude_keywords))
     else:
         feed_url = os.environ.get("CANVAS_CALENDAR_FEED_URL", "").strip()
-        slack_configured = bool(
-            (os.environ.get("SLACK_BOT_TOKEN") or os.environ.get("SLACK_USER_TOKEN"))
-            and csv_env_raw("SLACK_CHANNEL_IDS")
-        )
-        if not feed_url and not slack_configured:
+        if not feed_url and not slack_sources:
             raise SystemExit("Set CANVAS_CALENDAR_FEED_URL in .env before running this.")
         if feed_url:
             ics_text = fetch_canvas_feed(feed_url)
             deadlines.extend(parse_canvas_deadlines(ics_text, timezone_name, include_keywords, exclude_keywords))
 
-    deadlines.extend(fetch_slack_deadlines_from_env(timezone_name))
+    deadlines.extend(fetch_slack_deadlines_from_env(timezone_name, slack_sources))
     deadlines = sorted(deadlines, key=lambda item: item.due_at)
     now = dt.datetime.now(ZoneInfo(timezone_name))
     lookahead_days = int(os.environ.get("LOOKAHEAD_DAYS", "120"))
